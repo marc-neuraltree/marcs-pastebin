@@ -1,0 +1,165 @@
+This shows your node **does have Elasticsearch, Logstash, Redis, Kibana, Fleet, SOC, etc. running locally**, so this is effectively acting as a **manager/search-capable node**.
+
+But the key issue remains:
+
+```text
+Redis queue is increasing
+Only Logstash pipeline shown earlier was "manager"
+No data in Elasticsearch
+```
+
+So now verify whether this Logstash instance is only doing **manager receiver → Redis**, and not doing **Redis → Elasticsearch**.
+
+## 1. Check the Logstash pipeline files
+
+Run this on the manager:
+
+```bash
+sudo docker exec -it so-logstash bash -lc '
+echo "=== pipeline dir ==="
+find /usr/share/logstash/pipeline /etc/logstash -maxdepth 3 -type f 2>/dev/null -print
+
+echo "=== redis references ==="
+grep -RniE "input.*redis|redis.*input|output.*redis|logstash:unparsed|elasticsearch" /usr/share/logstash/pipeline /etc/logstash 2>/dev/null
+'
+```
+
+You are looking for two things:
+
+```text
+output redis ... logstash:unparsed
+input redis ... logstash:unparsed
+```
+
+If you only see `output redis`, that confirms Logstash is queueing to Redis but nothing in Logstash is consuming from Redis.
+
+## 2. Check if Security Onion expects another service to parse from Redis
+
+Search all SO config for the Redis consumer:
+
+```bash
+sudo grep -RniE "input.*redis|redis.*input|logstash:unparsed|redis.*6379|elasticsearch" \
+/opt/so/conf \
+/opt/so/saltstack/local \
+/opt/so/saltstack/default \
+2>/dev/null | head -300
+```
+
+If the config exists in Salt/default but not inside the running Logstash pipeline directory, the local config did not render correctly.
+
+## 3. Run highstate to re-render configs
+
+Because all containers are up but the expected consumer path appears missing, re-render Security Onion state:
+
+```bash
+sudo so-salt-call state.highstate
+```
+
+Then restart Logstash:
+
+```bash
+sudo docker restart so-logstash
+```
+
+Then re-check pipelines:
+
+```bash
+sudo docker exec so-logstash bash -lc "curl -s localhost:9600/_node/pipelines?pretty"
+```
+
+If it still only shows:
+
+```text
+"manager"
+```
+
+then the running config is still only loading the manager receiver pipeline.
+
+## 4. Check Logstash startup for disabled/skipped pipelines
+
+Immediately after restart:
+
+```bash
+sudo docker logs so-logstash --since 5m 2>&1 | \
+egrep -i "pipeline|converge|reload|config|error|failed|exception|redis|elasticsearch" | tail -200
+```
+
+You want to see whether it says any pipeline failed to start, or whether it intentionally loads only `manager`.
+
+## 5. Check Redis count after pausing input
+
+Temporarily stop the sensor agent:
+
+```bash
+sudo systemctl stop elastic-agent
+```
+
+Then on the manager:
+
+```bash
+watch -n 5 "sudo docker exec so-redis redis-cli -a '<REDIS_PASSWORD>' LLEN logstash:unparsed"
+```
+
+Interpretation:
+
+```text
+Decreasing = consumer exists but cannot keep up.
+Flat = no consumer is running.
+Increasing = another source is still feeding Redis.
+```
+
+Restart the sensor later:
+
+```bash
+sudo systemctl start elastic-agent
+```
+
+## 6. Check Elasticsearch directly
+
+Since `so-elasticsearch` is running, verify it is writable:
+
+```bash
+sudo so-elasticsearch-query _cluster/health?pretty
+sudo so-elasticsearch-query _cat/nodes?v
+sudo so-elasticsearch-query '_all/_settings/index.blocks.read_only_allow_delete?pretty'
+sudo so-elasticsearch-query '_cat/indices/logs-*?v' | tail -50
+```
+
+Then check for recent docs:
+
+```bash
+sudo so-elasticsearch-query 'logs-*/_search?pretty' -d '{
+  "size": 3,
+  "sort": [
+    {
+      "@timestamp": {
+        "order": "desc",
+        "unmapped_type": "date"
+      }
+    }
+  ],
+  "query": {
+    "match_all": {}
+  }
+}'
+```
+
+## What I think is happening
+
+Your latest screenshot proves the major services are running. Your earlier pipeline output proves only the `manager` Logstash pipeline is visible. The Redis key `logstash:unparsed` increasing means the manager pipeline is receiving and queueing events.
+
+The missing piece is:
+
+```text
+Redis logstash:unparsed → parser/indexer → Elasticsearch
+```
+
+So the next decisive command is the pipeline/config grep:
+
+```bash
+sudo docker exec -it so-logstash bash -lc '
+grep -RniE "input.*redis|redis.*input|output.*redis|logstash:unparsed|elasticsearch" /usr/share/logstash/pipeline /etc/logstash 2>/dev/null
+'
+```
+
+If there is no Redis input and no Elasticsearch output in the running pipeline config, that is why Redis grows and Elasticsearch stays empty.
